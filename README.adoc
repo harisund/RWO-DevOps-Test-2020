@@ -1,0 +1,194 @@
+= RWO Dev Ops Test 2020
+Hari Sundararajan
+:toc:
+
+== Assumptions
+
+* All the commands are being run on a Linux host
+* The Linux host has the following tools installed, in the path and with available permissions
+** kubectl
+** minikube
+** docker
+** Virtual Box
+
+NOTE: Docker hub or a docker hosting service access it not expected/ necessary, since the
+docker images will be directly built in the kubernetes environment inside the VirtualBox.
+
+== Start the minikube k8s environment
+
+ minikube start --vm-driver=virtualbox
+
+Verify the cluster is up by using any of the following commands
+
+ minikube status
+ minikube ip
+ minikube dashboard --url=true
+
+Verify that your kubectl can correctly access the cluster
+
+ kubectl get nodes
+
+
+== Preparing docker
+
+If you are using an external hosting service for the images, this step can be avoided. However,
+we are going to build the images inside the minikube environment.
+
+First, start by executing the following command
+
+ eval $(minikube docker-env)
+
+Once this is done, your current shell's docker is now connected to the minikube environment. Verify
+this by doing
+
+ docker images
+ docker ps
+
+
+You should see a bunch of images from `k8s.gcr.io`. This shows you are connected to the docker
+engine in the k8s cluster.
+
+NOTE: If you have multiple nodes, this method won't work, since you will have to build the images
+on each host, something you can't do with minikube anyway.
+
+== Creating the images
+
+Now that our docker application on the current shell has been connected to the k8s environment, let's build
+the images.
+
+=== Nginx
+
+This image takes the default nginx image and makes it return the static.json from the interview
+
+[source,bash]
+----
+cd nginx
+docker build -t rwo-nginx:1 .
+----
+
+=== ubuntu-with-runtime
+
+[source,bash]
+----
+ubuntu-with-runtime
+docker build -t ubuntu-with-runtime:1 .
+----
+
+NOTE: In theory, we only need the container `mcr.microsoft.com/dotnet/core/aspnet:3.1` . However,
+because we need to get the nginx container's IP address, we need to install custom utils. So we
+use the base bionic image and add the asp net runtime, along with the DNS packages we need.
+
+=== TestApi project
+
+Now, we build the final image needed for the process.
+
+This is a multi stage process. First, it uses the SDK to build the project, then it copies
+the build from the first stage into the second stage, which uses the runtime provided by the
+`ubuntu-with-runtime` image we built above.
+
+[source,bash]
+----
+cd multistage-build
+docker build -t rwo-project:1 .
+----
+
+[source,bash]
+----
+cd multistage-build
+docker build -t rwo-project:1 .
+----
+
+== Build Verification
+
+Now that the images are built on the k8s environment, you can do
+
+ docker images
+
+To verify that the `rwo-nginx:1` and `rwo-project:1` images are present in the k8s environment.
+
+If you wish to use an external hosting, the images will have to be tagged with the hosting URL, and
+a `docker push` will need to be executed.
+
+== Deployment
+
+Assuming your kubectl has the context set correctly, run the following commands
+
+[source,bash]
+----
+kubectl create deployment rwo-nginx --image=rwo-nginx:1
+kubectl expose deployment/rwo-nginx --port=80 --target-port=80 --type=ClusterIP
+
+kubectl create deployment rwo-project --image=rwo-project:1
+kubectl scale --replicas=2 deployment/rwo-project
+kubectl expose deployment/rwo-project --port=5001 --target-port=5001 --type=NodePort<1>
+----
+<1> An external node port can not be specified. It is assigned by kubernetes
+
+== Deployment verification
+
+The followign commands can be used to verify the deployment
+
+[source,bash]
+----
+kubectl get endpoints<1>
+kubectl get services<2>
+kubectl get deployments<3>
+kubectl get replicasets<4>
+kubectl get pods<5>
+minikube service list<6>
+----
+<1> shows all pod IPs and ports
+<2> show service details
+<3> shows 2 instances of rwo-project and 1 of rwo-nginx
+<4> shows 2 instances of rwo-project and 1 of rwo-nginx
+<5> you can use this output to run `kubectl log <nodename>` to verify dotnet output
+<6> you can access your service using https against the "URL" field output
+
+
+The output of `minikube service list` should look like this
+
+
+----
+$ minikube service list
+|----------------------|---------------------------|--------------|-----------------------------|
+|      NAMESPACE       |           NAME            | TARGET PORT  |             URL             |
+|----------------------|---------------------------|--------------|-----------------------------|
+| default              | kubernetes                | No node port |
+| default              | rwo-nginx                 | No node port |
+| default              | rwo-project               |         5001 | http://192.168.99.101:30587 |
+| kube-system          | kube-dns                  | No node port |
+| kubernetes-dashboard | dashboard-metrics-scraper | No node port |
+| kubernetes-dashboard | kubernetes-dashboard      | No node port |
+|----------------------|---------------------------|--------------|-----------------------------|
+----
+
+Since we using self signed certs, you can now access the end point with curl's insecure flag
+
+ curl -k https://192.168.99.101:30587/weatherforecast
+ curl -k https://192.168.99.101:30587/weatherforecast/stats
+ curl -k https://192.168.99.101:30587/weatherforecast/fetch
+
+Repeatedly pinging `/stats` end point will show both machine 1 and 0 (to show 2 instances)
+
+
+== Additional notes
+
+* Environment variables are copied once at the time an application is started, but not refreshed. That means
+the nginx image should be up and running before the TestApi application is deployed, otherwise it will
+not be able to retrieve the nginx node's IP.
+* k8s does DNS resolution for services, so a better way to do this would be to access the service by its
+name rather than using a environment variable, so that if the service goes down and gets brought back up
+with a new IP, the TestApi application will continue to run.
+* A self signed cert is created in the multi stage process in the first stage doing building, and is
+copied into the final image when running. Otherwise you will see errors about missing certificates
+* In prodution, the web site is typically served over 127.0.0.1:80 or 127.0.0.1:443. This is being
+over ridden using ASPNETCORE_URLS . Inside the docker container the process has to serve over
+0.0.0.0 so that port forwarding to the container can work
+* In the original test, the API response example says `https://IP:5001/`. However, ports under 30000
+can not be designated as NodePorts when trying to access an application internally. If you exec into
+a container and call the command, you can access by using 5001 directly, however outside the kubernetes
+cluster you will have to use the NodePort that's randomly assigned (or create a Yaml file with a specific
+port)
+* Nginx and rwo-project are deployed in the same name space. If you wish to deploy them in different
+name spaces, the `runner.sh` needs to refer to the nginx service by its FQDN with the appropriate namespace
+instead of the current `default`
